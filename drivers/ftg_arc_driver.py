@@ -1,15 +1,19 @@
 """
-FTG + 원호 검사(Arc Check) 반응형 주행기 (v3)
+FTG + 원호 검사(Arc Check) 반응형 주행기 (v3.1)
 
 FTG(Follow-the-Gap)만 쓰면 "어디가 뚫렸나"는 알지만 "차가 실제로 그쪽으로 돌아 들어갈 수 있나"는 모른다.
 그래서 berlin 헤어핀에서 핸들을 끝까지 꺾어도 회전이 모자라 바깥 벽에 닿았다(harness 장애물 3개: 충돌 0.81회/랩).
 
 이 주행기는 두 단계로 나눈다.
-  1) 방향: FTGDriver가 "가장 넓게 뚫린 방향"을 고른다.
-  2) 검사: 조향 후보(기본 31개)마다 차가 그릴 원호를 미리 그려서, 벽·장애물에 닿기 전까지 갈 수 있는 거리를 잰다.
-     FTG 방향에 가깝고 멀리 갈 수 있는 원호를 고르고, 그 거리 안에서 멈출 수 있는 속도로 달린다.
+  1) 방향: FTGDriver가 가려는 방향을 고른다. v3.1부터는 "가장 넓은" 빈틈이 아니라 "가장 깊은 점을 품은" 빈틈을 고른다.
+     (berlin s ≈ 24 m: 왼쪽으로 꺾이는 좁고 깊은 길 대신, 정면의 넓고 얕은 막다른 곳으로 들어가 U턴·역주행하던 문제 해결)
+  2) 검사: 조향 후보(기본 31개)마다 차가 그릴 길을 미리 그려서, 벽·장애물에 닿기 전까지 갈 수 있는 거리를 잰다.
+     v3.1부터는 후보 원호 앞에 '전환 구간'을 붙인다: 명령 지연(30 ms) 동안 지금 조향으로, 서보가 새 조향까지
+     도는 동안(3.2 rad/s) 중간 조향으로 달리는 길. 빠를수록·크게 꺾을수록 전환 구간이 길어져, 늦은 급회피가 불리해진다.
+     FTG 방향에 가깝고 멀리 갈 수 있는 길을 고르고, 그 거리 안에서 멈출 수 있는 속도로 달린다.
 
-- 입력은 라이다(scan)뿐이다. x, y, yaw, v, yaw_rate, t는 받기만 하고 쓰지 않는다 (주행 중 GT 미사용).
+- 입력은 라이다(scan)뿐이다. x, y, yaw, v, yaw_rate는 쓰지 않는다 (GT-free 모드의 ROS 노드는 NaN을 넘긴다).
+  지금 속도와 조향각은 '내가 보낸 명령'과 시뮬레이터 한계(서보 속도, 가속 한계)로 추정한다.
 - 지도, 레이싱라인, 맵 좌표를 쓰지 않는다 (구간별 하드코딩 없음).
 - 플래너와 제어기가 따로 있지 않고, 이 클래스 하나가 /drive를 낸다 (MUX 없음).
 - 팀 공통 인터페이스: act(scan, x, y, yaw, v, yaw_rate, t) -> (steer, speed), reset()
@@ -47,6 +51,13 @@ class FTGArcDriver:
         v_min: float = 0.3,            # 최저 속도 (m/s). 0이면 멈춰서 못 움직이므로 조금 남김
         max_range: float = 10.0,       # 이보다 먼 라이다 값은 잘라서 씀 (m)
         grid_res: float = 0.04,        # 원호 검사용 지역 격자 한 칸 크기 (m)
+        gap_mode: str = "deepest",     # FTG 빈틈 고르는 기준: 가장 깊은 점을 품은 빈틈 (막다른 곳 회피, ftg_driver.py 참고)
+        gap_keep: float = 0.0,         # FTG가 직전 빈틈을 유지하도록 주는 가산점 비율
+        transition: bool = True,       # True: 조향이 바뀌는 동안(지연 + 서보 회전) 차가 실제로 가는 길까지 검사
+        latency: float = 0.03,         # 명령이 차에 닿기까지 걸리는 시간 (s)
+        steer_rate: float = 3.2,       # 조향 서보가 돌 수 있는 최대 속도 (rad/s, 시뮬레이터 값)
+        accel_max: float = 9.5,        # 속도가 바뀔 수 있는 최대 가속도 (m/s^2), 내 속도 추정에 씀
+        n_pre: int = 6,                # 전환 구간 검사 지점 수
     ):
         self.fov = fov_rad
         self.lidar_ahead = lidar_ahead
@@ -58,7 +69,7 @@ class FTGArcDriver:
         self.v_max, self.v_min, self.max_range = v_max, v_min, max_range
 
         # 방향을 고를 FTG. 원호 검사가 떨림을 잡으므로 FTG 쪽 스무딩은 끈다(steer_smooth=0)
-        self.ftg = FTGDriver(fov_rad=fov_rad, max_steer=max_steer, steer_smooth=0.0)
+        self.ftg = FTGDriver(fov_rad=fov_rad, max_steer=max_steer, steer_smooth=0.0, gap_mode=gap_mode, gap_keep=gap_keep)
 
         # 조향 후보와 각 후보의 곡률(1/회전 반지름). 자전거 모델: 곡률 = tan(조향각) / 축간 거리
         self.steers = np.linspace(-max_steer, max_steer, n_arcs)
@@ -88,12 +99,18 @@ class FTGArcDriver:
         inside = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
         self.ix, self.iy, self.inside = np.where(inside, ix, 0), np.where(inside, iy, 0), inside
 
+        self.transition, self.latency, self.steer_rate = transition, latency, steer_rate
+        self.accel_max, self.n_pre, self.wheelbase = accel_max, n_pre, wheelbase
+        # 내가 보낸 명령으로 추정하는 지금의 실제 조향각·속도 (GT-free 모드에서는 v가 NaN으로 들어오므로)
+        self.est_delta, self.est_v, self.cmd_speed, self.last_t = 0.0, 0.0, 0.0, None
+
         self.prev = 0.0  # 직전 조향각 기억
 
     def reset(self):
         """새 에피소드 시작이나 차를 다시 놓았을 때 기억을 지운다"""
         self.prev = 0.0
         self.ftg.reset()
+        self.est_delta, self.est_v, self.cmd_speed, self.last_t = 0.0, 0.0, 0.0, None
 
     def _scan_points(self, scan) -> tuple:
         """라이다 거리 -> 뒷바퀴 축 기준 (x, y) 점들. 원호 근처에 있는 점만 남긴다"""
@@ -131,6 +148,80 @@ class FTGArcDriver:
         free[any_hit] = np.maximum(self.s[first[any_hit]] - 0.1, 0.0)    # 처음 걸리는 지점 조금 앞까지
         return free
 
+    @staticmethod
+    def _arc_pose(x0, y0, h0, k, s):
+        """(x0, y0, 방향 h0)에서 곡률 k로 거리 s만큼 갔을 때의 위치와 방향 (배열 연산 가능)"""
+        small = np.abs(k) < 1e-6
+        ks = np.where(small, 1.0, k)
+        x = np.where(small, x0 + s * np.cos(h0), x0 + (np.sin(h0 + ks * s) - np.sin(h0)) / ks)
+        y = np.where(small, y0 + s * np.sin(h0), y0 + (np.cos(h0) - np.cos(h0 + ks * s)) / ks)
+        return x, y, h0 + np.where(small, 0.0, k * s)
+
+    def _free_lengths_transition(self, px, py):
+        """조향 후보마다 갈 수 있는 거리. 단, 후보 조향에 닿기 전 '전환 구간'을 먼저 지난다고 보고 검사한다.
+
+        전환 구간 = 명령 지연(latency) 동안 지금 조향으로 + 서보가 새 조향까지 도는 동안 중간 조향으로 달리는 길.
+        속도가 빠르고 조향 차이가 클수록 전환 구간이 길어진다 → 늦게 꺾는 선택은 자연스럽게 불리해진다.
+        """
+        n = len(self.steers)
+        free = np.full(n, self.arc_len)
+        occ = np.zeros((self.nx, self.ny), dtype=bool)
+        ix = np.floor((px - self.gx0) / self.res).astype(int)
+        iy = np.floor((py - self.gy0) / self.res).astype(int)
+        ok = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
+        occ[ix[ok], iy[ok]] = True
+        if not occ.any():
+            return free
+        dist = distance_transform_edt(~occ) * self.res
+        v = max(self.est_v, 0.0)
+        # 1) 지연 구간: 지금 조향(est_delta)으로 v * latency 만큼
+        k_now = np.tan(self.est_delta) / self.wheelbase
+        l_lat = v * self.latency
+        # 2) 서보 구간: 중간 조향으로 v * |차이| / steer_rate 만큼
+        d_delta = np.abs(self.steers - self.est_delta)
+        l_ramp = v * d_delta / self.steer_rate
+        k_mid = np.tan(0.5 * (self.steers + self.est_delta)) / self.wheelbase
+        x1, y1, h1 = self._arc_pose(0.0, 0.0, 0.0, k_now, l_lat)                  # 지연 구간 끝 (후보 공통)
+        x2, y2, h2 = self._arc_pose(x1, y1, h1, k_mid, l_ramp)                    # 서보 구간 끝 (후보마다)
+        # 전환 구간 검사 지점들 (차 앞부분 위치)
+        f = np.linspace(0.0, 1.0, self.n_pre)[None, :]                            # (1, n_pre)
+        L_pre = l_lat + l_ramp                                                    # (n,)
+        s_pre = f * L_pre[:, None]                                                # (n, n_pre)
+        in_lat = s_pre <= l_lat
+        xa, ya, ha = self._arc_pose(0.0, 0.0, 0.0, k_now, np.minimum(s_pre, l_lat))
+        xb, yb, hb = self._arc_pose(x1, y1, h1, k_mid[:, None], np.maximum(s_pre - l_lat, 0.0))
+        xp = np.where(in_lat, xa, xb); yp = np.where(in_lat, ya, yb); hp = np.where(in_lat, ha, hb)
+        xp = xp + self.front * np.cos(hp); yp = yp + self.front * np.sin(hp)
+        # 후보 원호(앞부분 위치, 미리 계산한 cx, cy)를 서보 구간 끝 자세로 옮긴다
+        c, sn = np.cos(h2)[:, None], np.sin(h2)[:, None]
+        xc = x2[:, None] + c * self.cx - sn * self.cy
+        yc = y2[:, None] + sn * self.cx + c * self.cy
+        def clearance(xq, yq):
+            gx = np.floor((xq - self.gx0) / self.res).astype(int)
+            gy = np.floor((yq - self.gy0) / self.res).astype(int)
+            inside = (gx >= 0) & (gx < self.nx) & (gy >= 0) & (gy < self.ny)
+            return np.where(inside, dist[np.clip(gx, 0, self.nx - 1), np.clip(gy, 0, self.ny - 1)], np.inf)
+        r_need = np.sqrt(self.clear2)
+        hit_pre = clearance(xp, yp) < r_need                                      # (n, n_pre)
+        hit_arc = clearance(xc, yc) < r_need                                      # (n, 지점 수)
+        for i in range(n):
+            hp_i = np.flatnonzero(hit_pre[i])
+            if len(hp_i):
+                free[i] = max(s_pre[i, hp_i[0]] - 0.1, 0.0)                      # 전환 중에 이미 부딪힘
+                continue
+            ha_i = np.flatnonzero(hit_arc[i])
+            free[i] = L_pre[i] + (self.s[ha_i[0]] - 0.1 if len(ha_i) else self.arc_len)
+        return free
+
+    def _update_estimate(self, t):
+        """직전 명령으로 지금의 실제 조향각과 속도를 추정한다 (서보 속도·가속 한계를 따름)"""
+        dt = 0.02 if (self.last_t is None or not np.isfinite(t)) else float(np.clip(t - self.last_t, 0.005, 0.1))
+        self.last_t = t if np.isfinite(t) else None
+        step = self.steer_rate * dt
+        self.est_delta += float(np.clip(self.prev - self.est_delta, -step, step))
+        dv = self.accel_max * dt
+        self.est_v += float(np.clip(self.cmd_speed - self.est_v, -dv, dv))
+
     def act(self, scan, x, y, yaw, v, yaw_rate, t):
         """매 제어 주기(50 Hz) 호출. 출력: (조향각 rad, 왼쪽 +), (목표 속도 m/s)"""
         # 1. FTG가 원하는 방향 (FTG의 속도는 쓰지 않는다)
@@ -138,7 +229,11 @@ class FTGArcDriver:
 
         # 2. 원호 검사: 조향 후보마다 갈 수 있는 거리
         px, py = self._scan_points(scan)
-        free = self._free_lengths(px, py)
+        if self.transition:
+            self._update_estimate(t)
+            free = self._free_lengths_transition(px, py)
+        else:
+            free = self._free_lengths(px, py)
 
         # 3. 점수 = 갈 수 있는 거리(상한 free_cap) - FTG 방향과의 차이 벌점 - 직전 조향과의 차이 벌점
         score = (np.minimum(free, self.free_cap)
@@ -153,4 +248,5 @@ class FTGArcDriver:
         k = abs(self.kappa[i])
         v_turn = np.sqrt(self.a_lat / k) if k > 1e-3 else self.v_max             # v^2 * 곡률 = 옆 가속도
         speed = float(np.clip(min(v_brake, v_turn), self.v_min, self.v_max))
+        self.cmd_speed = speed
         return steer, speed
