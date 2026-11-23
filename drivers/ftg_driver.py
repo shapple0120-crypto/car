@@ -40,6 +40,8 @@ class FTGDriver:
         stop_speed: float = 0.5,                  # 정면이 아주 가까울 때 내려갈 수 있는 최저 속도 (m/s)
         stop_dist: float = 0.6,                   # 정면 최소 거리가 이 값(m)보다 가까우면 stop_speed까지 감속
         steer_smooth: float = 0.35,               # 핸들 떨림 방지: 이전 각도와 섞는 비율 (0~1)
+        gap_mode: str = "widest",                 # 빈틈 고르는 기준: "widest"(가장 넓은), "deepest"(가장 깊은 점을 품은), "area"(넓이x깊이)
+        gap_keep: float = 0.0,                    # 직전에 고른 방향이 들어 있는 빈틈에 주는 가산점 비율 (0이면 없음)
     ):
         # 받은 설정값들을 이 주행기 객체 안에 저장한다
         self.fov_rad = fov_rad
@@ -56,6 +58,9 @@ class FTGDriver:
         self.stop_speed = stop_speed
         self.stop_dist = stop_dist
         self.steer_smooth = steer_smooth
+        self.gap_mode = gap_mode
+        self.gap_keep = gap_keep
+        self.prev_target_angle = None             # 직전에 조준한 방향 (라디안). 빈틈 유지 가산점에 씀
 
         # 직전 프레임의 조향각을 기억해 두는 변수 (부드러운 핸들링용)
         self.prev_steer = 0.0
@@ -63,6 +68,7 @@ class FTGDriver:
     def reset(self):
         """새 에피소드가 시작되거나 차를 다시 놓았을 때 내부 기억을 초기화한다"""
         self.prev_steer = 0.0  # 이전 조향각 기억을 0(직진)으로 리셋
+        self.prev_target_angle = None
 
     def _clean_scan(self, scan) -> np.ndarray:
         """1-a단계: 라이다 이상값(NaN, 무한대)만 정리한 '원본' 거리"""
@@ -120,29 +126,39 @@ class FTGDriver:
         out[start_idx:end_idx] = 0.0                     # 이 구간은 갈 수 없게 거리 0으로 설정
         return out
 
-    def _find_best_gap(self, ranges: np.ndarray) -> tuple:
-        """4단계: gap_threshold보다 멀리 뚫린 구간 중 '가장 넓은 빈틈'을 찾는다 -> (시작, 끝) 인덱스"""
-        free = ranges > self.gap_threshold               # 기준보다 멀면 True(통과 가능)
-        best_start, best_end = 0, 0                      # 지금까지 찾은 가장 넓은 빈틈
-        cur_start = None                                 # 지금 재고 있는 빈틈의 시작점
+    def _find_best_gap(self, ranges: np.ndarray, keep_idx=None) -> tuple:
+        """4단계: gap_threshold보다 멀리 뚫린 연속 구간(빈틈)들 중 하나를 고른다 -> (시작, 끝) 인덱스
 
+        gap_mode
+          "widest" : 레이저 칸 수가 가장 많은(각도로 가장 넓은) 빈틈 (v2 기본)
+          "deepest": 가장 먼 점을 품은 빈틈. 넓지만 얕은 막다른 곳보다 좁아도 깊게 이어지는 길을 고른다
+          "area"   : 칸 수 x 평균 깊이가 가장 큰 빈틈
+        """
+        free = ranges > self.gap_threshold               # 기준보다 멀면 True(통과 가능)
+        gaps = []                                        # (시작, 끝) 목록
+        cur_start = None
         for i, is_free in enumerate(free):
             if is_free and cur_start is None:
                 cur_start = i                            # 새 빈틈 시작
             elif not is_free and cur_start is not None:
-                if (i - cur_start) > (best_end - best_start):   # 기존 최고보다 넓으면 교체
-                    best_start, best_end = cur_start, i
-                cur_start = None                         # 다음 빈틈을 위해 초기화
+                gaps.append((cur_start, i))              # 빈틈 끝
+                cur_start = None
+        if cur_start is not None:
+            gaps.append((cur_start, len(ranges)))        # 배열 끝까지 이어진 빈틈
 
-        # 배열 끝까지 빈틈이 이어진 경우 마무리
-        if cur_start is not None and (len(ranges) - cur_start) > (best_end - best_start):
-            best_start, best_end = cur_start, len(ranges)
-
-        # 기준을 넘는 빈틈이 하나도 없으면, 그나마 제일 먼 점 하나를 고른다
-        if best_end == best_start:
+        if not gaps:                                     # 지나갈 빈틈이 없으면 그나마 제일 먼 점 하나
             farthest = int(np.argmax(ranges))
             return farthest, farthest + 1
-        return best_start, best_end
+
+        if self.gap_mode == "deepest":
+            score = [float(np.max(ranges[a:b])) for a, b in gaps]
+        elif self.gap_mode == "area":
+            score = [(b - a) * float(np.mean(ranges[a:b])) for a, b in gaps]
+        else:
+            score = [b - a for a, b in gaps]
+        if keep_idx is not None and self.gap_keep > 0:            # 직전 방향이 들어 있는 빈틈은 점수를 올려 준다
+            score = [sc * (1.0 + self.gap_keep) if a <= keep_idx < b else sc for sc, (a, b) in zip(score, gaps)]
+        return gaps[int(np.argmax(score))]
 
     @staticmethod
     def _choose_target_index(ranges: np.ndarray, start: int, end: int) -> int:
@@ -178,8 +194,12 @@ class FTGDriver:
         safe = self._apply_safety_bubble(safe, angle_inc)
 
         # 4. 가장 넓은 빈틈을 찾고, 그 안에서 목표 지점을 고른다
-        gap_start, gap_end = self._find_best_gap(safe)
+        keep_idx = None
+        if self.prev_target_angle is not None:                    # 직전 조준 방향 -> 지금 배열의 인덱스
+            keep_idx = int(round(self.prev_target_angle / angle_inc)) + (mid - lo)
+        gap_start, gap_end = self._find_best_gap(safe, keep_idx)
         target_idx = self._choose_target_index(safe, gap_start, gap_end)
+        self.prev_target_angle = (target_idx - (mid - lo)) * angle_inc
 
         # 5. 목표 인덱스 -> 조향각. 정면보다 왼쪽(인덱스 큼)이면 +(왼쪽으로 꺾기)
         front_mid = mid - lo                                   # 전방 배열 안에서의 정면 위치
