@@ -15,6 +15,7 @@ FTG(Follow-the-Gap)만 쓰면 "어디가 뚫렸나"는 알지만 "차가 실제�
 - 팀 공통 인터페이스: act(scan, x, y, yaw, v, yaw_rate, t) -> (steer, speed), reset()
 """
 import numpy as np
+from scipy.ndimage import distance_transform_edt  # 격자에서 '가장 가까운 장애물 칸까지 거리'를 한 번에 구하는 함수
 
 from .ftg_driver import FTGDriver  # 같은 drivers 폴더의 FTG 주행기를 '방향 고르기' 부품으로 쓴다
 
@@ -45,6 +46,7 @@ class FTGArcDriver:
         v_max: float = 7.0,            # 최고 속도 (m/s)
         v_min: float = 0.3,            # 최저 속도 (m/s). 0이면 멈춰서 못 움직이므로 조금 남김
         max_range: float = 10.0,       # 이보다 먼 라이다 값은 잘라서 씀 (m)
+        grid_res: float = 0.04,        # 원호 검사용 지역 격자 한 칸 크기 (m)
     ):
         self.fov = fov_rad
         self.lidar_ahead = lidar_ahead
@@ -75,6 +77,17 @@ class FTGArcDriver:
         self.cx = x + front * np.cos(heading)
         self.cy = y + front * np.sin(heading)
 
+        # 원호 검사용 지역 격자: 뒷바퀴 축 기준 x는 -0.5 ~ arc_len+0.5 m, y는 ±(arc_len+0.5) m
+        self.res = grid_res
+        self.gx0, self.gy0 = -0.5, -(arc_len + 0.5)                     # 격자 왼쪽 아래 모서리 좌표
+        self.nx = int(np.ceil((arc_len + 1.0) / grid_res))              # x 방향 칸 수
+        self.ny = int(np.ceil((2 * arc_len + 1.0) / grid_res))          # y 방향 칸 수
+        # 원호 위 검사 지점들이 격자의 몇 번째 칸인지 미리 계산 (격자 밖은 -1)
+        ix = np.floor((self.cx - self.gx0) / grid_res).astype(int)
+        iy = np.floor((self.cy - self.gy0) / grid_res).astype(int)
+        inside = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
+        self.ix, self.iy, self.inside = np.where(inside, ix, 0), np.where(inside, iy, 0), inside
+
         self.prev = 0.0  # 직전 조향각 기억
 
     def reset(self):
@@ -95,14 +108,24 @@ class FTGArcDriver:
         return px[near], py[near]
 
     def _free_lengths(self, px: np.ndarray, py: np.ndarray) -> np.ndarray:
-        """조향 후보마다: 원호를 따라 벽·장애물에 닿기 전까지 갈 수 있는 거리 (m)"""
+        """조향 후보마다: 원호를 따라 벽·장애물에 닿기 전까지 갈 수 있는 거리 (m)
+
+        방법: 라이다 점을 작은 격자(4 cm 칸)에 찍고, 거리 변환으로 '각 칸에서 가장 가까운 점까지 거리' 지도를 만든다.
+        그다음 원호 위 검사 지점의 칸에서 그 값을 읽기만 하면 된다 (점마다 거리를 일일이 재는 것보다 훨씬 빠름).
+        """
         free = np.full(len(self.steers), self.arc_len)                   # 아무것도 안 걸리면 끝까지
         if len(px) == 0:
             return free
-        # 모든 후보의 모든 검사 지점과 모든 라이다 점 사이 거리를 한 번에 계산 (반복문보다 빠름)
-        dx = self.cx.reshape(-1, 1) - px[None, :]                        # (후보 수 x 지점 수, 라이다 점 수)
-        dy = self.cy.reshape(-1, 1) - py[None, :]
-        hit = (np.min(dx * dx + dy * dy, axis=1) < self.clear2).reshape(self.cx.shape)  # 지점마다 여유가 모자라나?
+        occ = np.zeros((self.nx, self.ny), dtype=bool)                   # 격자: True = 라이다 점이 있는 칸
+        ix = np.floor((px - self.gx0) / self.res).astype(int)
+        iy = np.floor((py - self.gy0) / self.res).astype(int)
+        ok = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
+        occ[ix[ok], iy[ok]] = True
+        if not occ.any():
+            return free
+        dist = distance_transform_edt(~occ) * self.res                   # 각 칸에서 가장 가까운 점 칸까지 거리 (m)
+        d = np.where(self.inside, dist[self.ix, self.iy], np.inf)        # 원호 위 검사 지점마다 여유 거리
+        hit = d < np.sqrt(self.clear2)                                   # 여유가 모자란 지점
         any_hit = hit.any(axis=1)                                        # 후보마다 한 번이라도 걸리나?
         first = np.argmax(hit, axis=1)                                   # 처음 걸리는 지점 번호
         free[any_hit] = np.maximum(self.s[first[any_hit]] - 0.1, 0.0)    # 처음 걸리는 지점 조금 앞까지
